@@ -1,0 +1,16 @@
+{
+  "name": "caldav-mcp",
+  "version": "1.0.0",
+  "description": "MCP service for CalDAV calendar operations",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "tsdav": "^2.1.0",
+    "dotenv": "^16.0.0",
+    "ical.js": "^2.0.0"
+  }
+}
