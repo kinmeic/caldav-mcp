@@ -5,7 +5,7 @@ import {
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import pkg from 'tsdav';
-const { createDAVClient, createAccount, fetchCalendars, fetchCalendarObjects, getBasicAuthHeaders } = pkg;
+const { createDAVClient, createAccount, fetchCalendars, fetchCalendarObjects, getBasicAuthHeaders, freeBusyQuery } = pkg;
 import * as dotenv from 'dotenv';
 import ICAL from 'ical.js';
 import { randomUUID } from 'crypto';
@@ -427,6 +427,107 @@ class CalDAVServer {
               required: ['calendar_id', 'todo_id'],
             },
           },
+          // Advanced tools
+          {
+            name: 'find_free_busy',
+            description: 'Find free time slots within a date range',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                calendar_id: {
+                  type: 'string',
+                  description: 'The calendar ID',
+                },
+                start_date: {
+                  type: 'string',
+                  description: 'Start date in ISO format',
+                },
+                end_date: {
+                  type: 'string',
+                  description: 'End date in ISO format',
+                },
+              },
+              required: ['calendar_id', 'start_date', 'end_date'],
+            },
+          },
+          {
+            name: 'check_conflict',
+            description: 'Check if there is a time conflict with existing events',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                calendar_id: {
+                  type: 'string',
+                  description: 'The calendar ID',
+                },
+                start_date: {
+                  type: 'string',
+                  description: 'Start date in ISO format',
+                },
+                end_date: {
+                  type: 'string',
+                  description: 'End date in ISO format',
+                },
+              },
+              required: ['calendar_id', 'start_date', 'end_date'],
+            },
+          },
+          {
+            name: 'search_events',
+            description: 'Search events by title or description keyword',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                calendar_id: {
+                  type: 'string',
+                  description: 'The calendar ID',
+                },
+                query: {
+                  type: 'string',
+                  description: 'Search keyword',
+                },
+              },
+              required: ['calendar_id', 'query'],
+            },
+          },
+          {
+            name: 'create_recurring_event',
+            description: 'Create a recurring event with RRULE',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                calendar_id: {
+                  type: 'string',
+                  description: 'The calendar ID',
+                },
+                title: {
+                  type: 'string',
+                  description: 'Event title/summary',
+                },
+                description: {
+                  type: 'string',
+                  description: 'Event description',
+                },
+                start_date: {
+                  type: 'string',
+                  description: 'Start date and time in ISO format',
+                },
+                end_date: {
+                  type: 'string',
+                  description: 'End date and time in ISO format',
+                },
+                location: {
+                  type: 'string',
+                  description: 'Event location (optional)',
+                },
+                rrule: {
+                  type: 'string',
+                  description: 'Recurrence rule (e.g., FREQ=WEEKLY;BYDAY=MO,WE,FR or FREQ=DAILY;COUNT=10 or FREQ=MONTHLY;BYDAY=1FR)',
+                },
+              },
+              required: ['calendar_id', 'title', 'start_date', 'end_date', 'rrule'],
+            },
+          },
         ],
       };
     });
@@ -458,6 +559,14 @@ class CalDAVServer {
             return await this.updateTodo(args);
           case 'delete_todo':
             return await this.deleteTodo(args);
+          case 'find_free_busy':
+            return await this.findFreeBusy(args);
+          case 'check_conflict':
+            return await this.checkConflict(args);
+          case 'search_events':
+            return await this.searchEvents(args);
+          case 'create_recurring_event':
+            return await this.createRecurringEvent(args);
           default:
             throw new Error(`Unknown tool: ${name}`);
         }
@@ -666,9 +775,9 @@ END:VCALENDAR`;
   }
 
   async updateEvent(args) {
-    const { calendar_id, event_id, ...eventArgs } = args;
+    const { calendar_id, event_id, title, description, start_date, end_date, location } = args;
 
-    // Find the event to get its URL
+    // Find the event to get its URL and existing data
     const events = await this.listCalendarObjects(
       calendar_id,
       new Date('2000-01-01'),
@@ -690,8 +799,57 @@ END:VCALENDAR`;
       throw new Error('Event not found');
     }
 
-    // Generate ICS with existing UID to preserve it
-    const { ics } = this.generateICS({ ...eventArgs, uid: event_id });
+    // Parse existing event to get original values
+    const parsed = ICAL.parse(event.icalString);
+    const comp = new ICAL.Component(parsed);
+    const vevent = comp.getFirstSubcomponent('vevent');
+
+    // Merge: use new value if provided, otherwise keep original
+    const existingTitle = vevent.getFirstPropertyValue('summary');
+    const existingDescription = vevent.getFirstPropertyValue('description');
+    const existingLocation = vevent.getFirstPropertyValue('location');
+    const existingDtstart = vevent.getFirstPropertyValue('dtstart');
+    const existingDtend = vevent.getFirstPropertyValue('dtend');
+
+    // Convert existing ICAL time to ISO string
+    const formatIcalToIso = (icalTime) => {
+      if (!icalTime) return null;
+      // Handle ICAL.Time object
+      if (icalTime && typeof icalTime === 'object' && icalTime.year !== undefined) {
+        const year = icalTime.year;
+        const month = String(icalTime.month).padStart(2, '0');
+        const day = String(icalTime.day).padStart(2, '0');
+        const hour = String(icalTime.hour).padStart(2, '0');
+        const minute = String(icalTime.minute).padStart(2, '0');
+        const second = String(icalTime.second).padStart(2, '0');
+        return `${year}-${month}-${day}T${hour}:${minute}:${second}Z`;
+      }
+      // Handle string format like 20260305T153000Z
+      if (typeof icalTime === 'string') {
+        const match = icalTime.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z?$/);
+        if (match) {
+          return `${match[1]}-${match[2]}-${match[3]}T${match[4]}:${match[5]}:${match[6]}Z`;
+        }
+        return icalTime;
+      }
+      return String(icalTime);
+    };
+
+    const mergedTitle = title !== undefined ? title : existingTitle;
+    const mergedDescription = description !== undefined ? description : existingDescription;
+    const mergedLocation = location !== undefined ? location : existingLocation;
+    const mergedStartDate = start_date || formatIcalToIso(existingDtstart);
+    const mergedEndDate = end_date || formatIcalToIso(existingDtend);
+
+    // Generate ICS with merged values
+    const { ics } = this.generateICS({
+      title: mergedTitle,
+      description: mergedDescription,
+      location: mergedLocation,
+      start_date: mergedStartDate,
+      end_date: mergedEndDate,
+      uid: event_id,
+    });
 
     // Update at the event's URL, not the calendar URL
     const absoluteUrl = this.ensureAbsoluteUrl(calendar_id, event.url);
@@ -711,7 +869,17 @@ END:VCALENDAR`;
       content: [
         {
           type: 'text',
-          text: JSON.stringify({ success: true, event_id: event_id }, null, 2),
+          text: JSON.stringify({
+            success: true,
+            event_id: event_id,
+            updated: {
+              title: mergedTitle,
+              description: mergedDescription,
+              location: mergedLocation,
+              start_date: mergedStartDate,
+              end_date: mergedEndDate,
+            },
+          }, null, 2),
         },
       ],
     };
@@ -1027,6 +1195,288 @@ END:VCALENDAR`;
         {
           type: 'text',
           text: JSON.stringify({ success: true, deleted_todo_id: todo_id }, null, 2),
+        },
+      ],
+    };
+  }
+
+  // ========== Advanced Features ==========
+
+  async findFreeBusy(args) {
+    const { calendar_id, start_date, end_date } = args;
+
+    try {
+      const result = await freeBusyQuery({
+        url: calendar_id,
+        timeRange: {
+          start: new Date(start_date).toISOString(),
+          end: new Date(end_date).toISOString(),
+        },
+        headers: this.authHeaders,
+      });
+
+      // Parse VFREEBUSY response
+      let busyPeriods = [];
+      try {
+        const responseXml = await result.text();
+        // Extract FREEBUSY periods from response
+        const fbRegex = /<C:freebusy>([^<]+)<\/C:freebusy>/g;
+        let match;
+        while ((match = fbRegex.exec(responseXml)) !== null) {
+          busyPeriods.push(match[1]);
+        }
+      } catch (e) {
+        // If parsing fails, return raw response
+      }
+
+      // Also get events to calculate free time
+      const events = await this.listCalendarObjects(
+        calendar_id,
+        new Date(start_date),
+        new Date(end_date)
+      );
+
+      const busyEvents = events
+        .filter((e) => e.icalString && e.icalString.includes('VEVENT'))
+        .map((event) => {
+          try {
+            const parsed = ICAL.parse(event.icalString);
+            const comp = new ICAL.Component(parsed);
+            const vevent = comp.getFirstSubcomponent('vevent');
+            if (vevent) {
+              return {
+                id: vevent.getFirstPropertyValue('uid'),
+                title: vevent.getFirstPropertyValue('summary'),
+                start: vevent.getFirstPropertyValue('dtstart')?.toString(),
+                end: vevent.getFirstPropertyValue('dtend')?.toString(),
+              };
+            }
+          } catch {}
+          return null;
+        })
+        .filter(Boolean);
+
+      // Calculate free periods
+      const startTime = new Date(start_date).getTime();
+      const endTime = new Date(end_date).getTime();
+      const sortedEvents = busyEvents.sort((a, b) => new Date(a.start) - new Date(b.start));
+
+      const freeSlots = [];
+      let currentTime = startTime;
+
+      for (const event of sortedEvents) {
+        const eventStart = new Date(event.start).getTime();
+        const eventEnd = new Date(event.end).getTime();
+
+        if (eventStart > currentTime) {
+          freeSlots.push({
+            start: new Date(currentTime).toISOString(),
+            end: new Date(eventStart).toISOString(),
+          });
+        }
+        currentTime = Math.max(currentTime, eventEnd);
+      }
+
+      if (currentTime < endTime) {
+        freeSlots.push({
+          start: new Date(currentTime).toISOString(),
+          end: new Date(endTime).toISOString(),
+        });
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              busy_events: busyEvents,
+              free_slots: freeSlots,
+              total_busy: busyEvents.length,
+              total_free: freeSlots.length,
+            }, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      throw new Error(`Failed to query free/busy: ${error.message}`);
+    }
+  }
+
+  async checkConflict(args) {
+    const { calendar_id, start_date, end_date } = args;
+
+    const events = await this.listCalendarObjects(
+      calendar_id,
+      new Date(start_date),
+      new Date(end_date)
+    );
+
+    const newStart = new Date(start_date).getTime();
+    const newEnd = new Date(end_date).getTime();
+
+    const conflicts = events
+      .filter((e) => e.icalString && e.icalString.includes('VEVENT'))
+      .map((event) => {
+        try {
+          const parsed = ICAL.parse(event.icalString);
+          const comp = new ICAL.Component(parsed);
+          const vevent = comp.getFirstSubcomponent('vevent');
+          if (vevent) {
+            const eventStart = new Date(vevent.getFirstPropertyValue('dtstart')).getTime();
+            const eventEnd = new Date(vevent.getFirstPropertyValue('dtend')).getTime();
+
+            // Check for overlap
+            if (newStart < eventEnd && newEnd > eventStart) {
+              return {
+                id: vevent.getFirstPropertyValue('uid'),
+                title: vevent.getFirstPropertyValue('summary'),
+                start: vevent.getFirstPropertyValue('dtstart')?.toString(),
+                end: vevent.getFirstPropertyValue('dtend')?.toString(),
+              };
+            }
+          }
+        } catch {}
+        return null;
+      })
+      .filter(Boolean);
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            has_conflict: conflicts.length > 0,
+            conflicts: conflicts,
+          }, null, 2),
+        },
+      ],
+    };
+  }
+
+  async searchEvents(args) {
+    const { calendar_id, query } = args;
+
+    // Fetch a wide range of events
+    const events = await this.listCalendarObjects(
+      calendar_id,
+      new Date('2000-01-01'),
+      new Date('2100-12-31')
+    );
+
+    const queryLower = query.toLowerCase();
+    const results = events
+      .filter((e) => e.icalString && e.icalString.includes('VEVENT'))
+      .map((event) => {
+        try {
+          const parsed = ICAL.parse(event.icalString);
+          const comp = new ICAL.Component(parsed);
+          const vevent = comp.getFirstSubcomponent('vevent');
+          if (vevent) {
+            const title = vevent.getFirstPropertyValue('summary') || '';
+            const description = vevent.getFirstPropertyValue('description') || '';
+            const location = vevent.getFirstPropertyValue('location') || '';
+
+            if (
+              title.toLowerCase().includes(queryLower) ||
+              description.toLowerCase().includes(queryLower) ||
+              location.toLowerCase().includes(queryLower)
+            ) {
+              return {
+                id: vevent.getFirstPropertyValue('uid'),
+                title: title,
+                description: description,
+                location: location,
+                start: vevent.getFirstPropertyValue('dtstart')?.toString(),
+                end: vevent.getFirstPropertyValue('dtend')?.toString(),
+              };
+            }
+          }
+        } catch {}
+        return null;
+      })
+      .filter(Boolean);
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            query: query,
+            count: results.length,
+            results: results,
+          }, null, 2),
+        },
+      ],
+    };
+  }
+
+  generateRecurringICS(args) {
+    const { title, description, start_date, end_date, location, rrule, uid: existingUid } = args;
+    const uid = existingUid || randomUUID();
+
+    const formatDate = (dateStr) => {
+      const date = new Date(dateStr);
+      return date.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z';
+    };
+
+    const now = formatDate(new Date());
+    const start = formatDate(start_date);
+    const end = formatDate(end_date);
+
+    let ics = `BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//CalDAV MCP//EN
+CALSCALE:GREGORIAN
+METHOD:PUBLISH
+BEGIN:VEVENT
+UID:${uid}
+DTSTAMP:${now}
+DTSTART:${start}
+DTEND:${end}
+SUMMARY:${title}
+RRULE:${rrule}
+`;
+
+    if (description) {
+      ics += `DESCRIPTION:${description}\n`;
+    }
+    if (location) {
+      ics += `LOCATION:${location}\n`;
+    }
+
+    ics += `END:VEVENT
+END:VCALENDAR`;
+
+    return { ics, uid };
+  }
+
+  async createRecurringEvent(args) {
+    const { calendar_id } = args;
+    const { ics, uid } = this.generateRecurringICS(args);
+
+    const url = calendar_id + uid + '.ics';
+    const response = await this.davRequest(url, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'text/calendar; charset=utf-8',
+        'If-None-Match': '*',
+      },
+      body: ics,
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to create recurring event: ${response.status} ${response.statusText}`);
+    }
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            event_id: uid,
+            rrule: args.rrule,
+          }, null, 2),
         },
       ],
     };

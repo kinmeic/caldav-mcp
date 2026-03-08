@@ -65,6 +65,23 @@ npm start
 - `location`: 地点（可选）
 - `priority`: 优先级 1(高) / 5(中) / 9(低) / 0(无)
 - `status`: 状态 NEEDS-ACTION / IN-PROCESS / COMPLETED / CANCELLED
+- `rrule`: 重复规则，如 `FREQ=WEEKLY;BYDAY=MO,WE,FR`
+
+### 高级功能
+
+| 工具名 | 描述 | 必需参数 |
+|--------|------|----------|
+| `find_free_busy` | 查询空闲时段 | `calendar_id`, `start_date`, `end_date` |
+| `check_conflict` | 检测时间冲突 | `calendar_id`, `start_date`, `end_date` |
+| `search_events` | 搜索事件 | `calendar_id`, `query` |
+| `create_recurring_event` | 创建重复日程 | `calendar_id`, `title`, `start_date`, `end_date`, `rrule` |
+
+### RRULE 示例
+
+- 每周一、三、五: `FREQ=WEEKLY;BYDAY=MO,WE,FR`
+- 每天重复10次: `FREQ=DAILY;COUNT=10`
+- 每月第一个周五: `FREQ=MONTHLY;BYDAY=1FR`
+- 每周一至周五: `FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR`
 
 ## 在Claude Code中使用
 
